@@ -257,13 +257,18 @@ choose_disk_if_missing() {
   local idx
   local choice
 
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    disk_rows+=("$line")
-    disk_paths+=("$(awk '{print $1}' <<< "$line")")
-  done < <(lsblk -dnpo NAME,SIZE,MODEL,TYPE | awk '$4=="disk" {print $1, $2, $3}')
+  while IFS='|' read -r path size model; do
+    [[ -n "$path" ]] || continue
+    disk_paths+=("$path")
+    disk_rows+=("$path $size ${model:-UnknownModel}")
+    done < <(lsblk -J -d -o PATH,SIZE,MODEL,TYPE | python -c "import json,sys; data=json.load(sys.stdin); [print(f\"{(d.get('path') or '')}|{(d.get('size') or '')}|{(d.get('model') or '')}\") for d in data.get('blockdevices', []) if d.get('type')=='disk' and (d.get('path') or '').startswith('/dev/') and not (d.get('path') or '').startswith('/dev/zram') and (d.get('size') or '') not in ('0B','')]" )
 
-  [[ ${#disk_paths[@]} -gt 0 ]] || die "No installable disks found."
+  if [[ ${#disk_paths[@]} -eq 0 ]]; then
+    warn "Auto-detection found no installable disks."
+    read -r -p "Enter install disk manually (example: /dev/vda): " DISK
+    [[ -b "$DISK" ]] || die "Disk not found: $DISK"
+    return
+  fi
 
   for idx in "${!disk_rows[@]}"; do
     printf "  %d) %s\n" "$((idx + 1))" "${disk_rows[$idx]}"
