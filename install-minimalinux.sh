@@ -1039,6 +1039,23 @@ deploy_repo_dotconfig_assets() {
   fi
 }
 
+update_xdg_user_dirs() {
+  msg "Updating XDG user directories for ${USERNAME}"
+
+  if ! id -u "$USERNAME" >/dev/null 2>&1; then
+    warn "User ${USERNAME} does not exist; skipping xdg-user-dirs-update"
+    return
+  fi
+
+  if ! command -v xdg-user-dirs-update >/dev/null 2>&1; then
+    warn "xdg-user-dirs-update not found; skipping"
+    return
+  fi
+
+  runuser -u "$USERNAME" -- env HOME="/home/${USERNAME}" xdg-user-dirs-update \
+    || warn "Failed to update XDG user directories for ${USERNAME}"
+}
+
 setup_i2c() {
   msg "Configuring i2c-dev"
   modprobe i2c-dev || true
@@ -1167,6 +1184,7 @@ finalize_in_chroot() {
   configure_base_system
   deploy_repo_dotconfig_assets
   provision_minimalinux_stack
+  update_xdg_user_dirs
   apply_hypr_config_assets
   if [[ "${BOOTLOADER_DONE_BY_ARCHINSTALL:-0}" != "1" ]]; then
     install_bootloader
