@@ -15,6 +15,7 @@ TARGET_MNT="/mnt"
 DISK=""
 ROOT_PART=""
 EFI_PART=""
+BOOT_PART=""
 SWAP_PART=""
 BOOTLOADER="grub"
 FS_TYPE="ext4"
@@ -29,14 +30,46 @@ USERNAME="user"
 USER_PASSWORD=""
 ROOT_PASSWORD=""
 FIRMWARE_MODE=""
+BOOTLOADER_DONE_BY_ARCHINSTALL="0"
 
 msg() {
   printf "\n==> %s\n" "$1"
 }
 
+warn() {
+  printf "\n[WARN] %s\n" "$1" >&2
+}
+
 die() {
   printf "\nERROR: %s\n" "$1" >&2
+  printf "See log: %s\n" "$LOG_FILE" >&2
   exit 1
+}
+
+show_welcome_banner() {
+  cat <<'EOF'
+=========================================
+  minimaLinux Guided Installer
+=========================================
+This installer will:
+  - Partition and format the selected disk
+  - Install Arch Linux + selected bootloader
+  - Apply minimaLinux packages and configuration
+
+WARNING: Selected disk data will be permanently erased.
+EOF
+}
+
+run_preflight_checks() {
+  msg "Running preflight checks"
+
+  if ! ping -c 1 -W 2 archlinux.org >/dev/null 2>&1; then
+    warn "Internet check failed (archlinux.org unreachable). Install may fail while fetching packages."
+  fi
+
+  if [[ ! -d /sys/firmware/efi && ! -d /sys/firmware/efi/efivars ]]; then
+    warn "System appears to be booted in BIOS mode."
+  fi
 }
 
 usage() {
@@ -82,6 +115,7 @@ require_common_tools() {
 }
 
 require_full_install_tools() {
+  command -v archinstall >/dev/null 2>&1 || die "archinstall is required."
   command -v pacstrap >/dev/null 2>&1 || die "pacstrap is required."
   command -v genfstab >/dev/null 2>&1 || die "genfstab is required."
   command -v arch-chroot >/dev/null 2>&1 || die "arch-chroot is required."
@@ -215,10 +249,35 @@ choose_disk_if_missing() {
     return
   fi
 
-  msg "Available block devices"
-  lsblk -d -o NAME,SIZE,MODEL,TYPE
-  echo
-  read -r -p "Enter install disk (example: /dev/nvme0n1): " DISK
+  msg "Select target install disk"
+
+  local -a disk_rows=()
+  local -a disk_paths=()
+  local line
+  local idx
+  local choice
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    disk_rows+=("$line")
+    disk_paths+=("$(awk '{print $1}' <<< "$line")")
+  done < <(lsblk -dnpo NAME,SIZE,MODEL,TYPE | awk '$4=="disk" {print $1, $2, $3}')
+
+  [[ ${#disk_paths[@]} -gt 0 ]] || die "No installable disks found."
+
+  for idx in "${!disk_rows[@]}"; do
+    printf "  %d) %s\n" "$((idx + 1))" "${disk_rows[$idx]}"
+  done
+
+  while true; do
+    read -r -p "Choose disk number [1-${#disk_paths[@]}]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#disk_paths[@]} )); then
+      DISK="${disk_paths[$((choice - 1))]}"
+      break
+    fi
+    echo "Invalid selection."
+  done
+
   [[ -b "$DISK" ]] || die "Disk not found: $DISK"
 }
 
@@ -441,6 +500,10 @@ partition_and_mount_disk() {
     die "Aborted by user."
   fi
 
+  local confirmation_input
+  read -r -p "Type the exact disk path to confirm (${DISK}): " confirmation_input
+  [[ "$confirmation_input" == "$DISK" ]] || die "Disk confirmation mismatch. Aborted."
+
   swapoff -a || true
   umount -R "$TARGET_MNT" >/dev/null 2>&1 || true
 
@@ -457,6 +520,7 @@ partition_and_mount_disk() {
     partprobe "$DISK" || true
     udevadm settle || true
     EFI_PART="$(partition_path "$DISK" 1)"
+    BOOT_PART="$EFI_PART"
     ROOT_PART="$(partition_path "$DISK" 2)"
     if [[ "$SWAP_MODE" == "partition" ]]; then
       SWAP_PART="$(partition_path "$DISK" 3)"
@@ -470,22 +534,27 @@ partition_and_mount_disk() {
     mount "$EFI_PART" "$TARGET_MNT/boot"
   else
     parted -s "$DISK" mklabel msdos
+    parted -s "$DISK" mkpart primary ext4 1MiB 1025MiB
     if [[ "$SWAP_MODE" == "partition" ]]; then
-      parted -s "$DISK" mkpart primary ext4 1MiB "-$((SWAP_SIZE_GIB))GiB"
+      parted -s "$DISK" mkpart primary ext4 1025MiB "-$((SWAP_SIZE_GIB))GiB"
       parted -s "$DISK" mkpart primary linux-swap "-$((SWAP_SIZE_GIB))GiB" 100%
     else
-      parted -s "$DISK" mkpart primary ext4 1MiB 100%
+      parted -s "$DISK" mkpart primary ext4 1025MiB 100%
     fi
     parted -s "$DISK" set 1 boot on
     partprobe "$DISK" || true
     udevadm settle || true
-    ROOT_PART="$(partition_path "$DISK" 1)"
+    BOOT_PART="$(partition_path "$DISK" 1)"
+    ROOT_PART="$(partition_path "$DISK" 2)"
     if [[ "$SWAP_MODE" == "partition" ]]; then
-      SWAP_PART="$(partition_path "$DISK" 2)"
+      SWAP_PART="$(partition_path "$DISK" 3)"
     fi
 
+    mkfs.ext4 -F "$BOOT_PART"
     format_root_filesystem
     mount_root_filesystem
+    mkdir -p "$TARGET_MNT/boot"
+    mount "$BOOT_PART" "$TARGET_MNT/boot"
   fi
 }
 
@@ -518,13 +587,85 @@ install_arch_base() {
   fi
 }
 
+ensure_swap_fstab_entry_in_target() {
+  if [[ "$SWAP_MODE" == "swapfile" ]]; then
+    local swapfile_path="/swapfile"
+    if [[ "$FS_TYPE" == "btrfs" ]]; then
+      swapfile_path="/swap/swapfile"
+    fi
+
+    if ! grep -qE "^[^#].*${swapfile_path//\//\\/}[[:space:]]+none[[:space:]]+swap" "$TARGET_MNT/etc/fstab"; then
+      echo "${swapfile_path} none swap defaults 0 0" >> "$TARGET_MNT/etc/fstab"
+    fi
+  elif [[ "$SWAP_MODE" == "partition" && -n "$SWAP_PART" ]]; then
+    local swap_uuid
+    swap_uuid="$(blkid -s UUID -o value "$SWAP_PART" 2>/dev/null || true)"
+    if [[ -n "$swap_uuid" ]] && ! grep -q "$swap_uuid" "$TARGET_MNT/etc/fstab"; then
+      echo "UUID=${swap_uuid} none swap defaults 0 0" >> "$TARGET_MNT/etc/fstab"
+    fi
+  fi
+}
+
+run_archinstall_on_premounted_target() {
+  msg "Running archinstall guided install on pre-mounted target"
+
+  local config_file
+  local locale_lang
+  local bootloader_name
+
+  config_file="$(mktemp /tmp/minimalinux-archinstall-config.XXXXXX.json)"
+  locale_lang="${LOCALE%%.*}"
+
+  case "$BOOTLOADER" in
+    grub) bootloader_name="Grub" ;;
+    systemd-boot) bootloader_name="Systemd-boot" ;;
+    *) die "Unsupported bootloader for archinstall config: ${BOOTLOADER}" ;;
+  esac
+
+  cat > "$config_file" <<EOF
+{
+  "archinstall-language": "English",
+  "bootloader_config": {
+    "bootloader": "${bootloader_name}",
+    "uki": false,
+    "removable": true
+  },
+  "disk_config": {
+    "config_type": "pre_mounted_config",
+    "mountpoint": "${TARGET_MNT}"
+  },
+  "hostname": "${HOSTNAME}",
+  "kernels": ["linux"],
+  "locale_config": {
+    "kb_layout": "us",
+    "sys_enc": "UTF-8",
+    "sys_lang": "${locale_lang}"
+  },
+  "ntp": true,
+  "packages": [],
+  "script": "guided",
+  "silent": true,
+  "swap": {
+    "enabled": false
+  },
+  "timezone": "${TIMEZONE}"
+}
+EOF
+
+  archinstall --config "$config_file" --silent --mountpoint "$TARGET_MNT" --skip-version-check
+
+  BOOTLOADER_DONE_BY_ARCHINSTALL="1"
+}
+
 write_install_env() {
   cat > "$TARGET_MNT/root/minimalinux-install.env" <<EOF
 DISK='${DISK}'
 ROOT_PART='${ROOT_PART}'
 EFI_PART='${EFI_PART}'
+BOOT_PART='${BOOT_PART}'
 SWAP_PART='${SWAP_PART}'
 BOOTLOADER='${BOOTLOADER}'
+BOOTLOADER_DONE_BY_ARCHINSTALL='${BOOTLOADER_DONE_BY_ARCHINSTALL}'
 FS_TYPE='${FS_TYPE}'
 SWAP_MODE='${SWAP_MODE}'
 SWAP_SIZE_GIB='${SWAP_SIZE_GIB}'
@@ -968,12 +1109,18 @@ finalize_in_chroot() {
   configure_base_system
   provision_minimalinux_stack
   apply_hypr_config_assets
-  install_bootloader
+  if [[ "${BOOTLOADER_DONE_BY_ARCHINSTALL:-0}" != "1" ]]; then
+    install_bootloader
+  else
+    msg "Bootloader was already installed by archinstall; skipping manual bootloader step"
+  fi
   msg "Chroot install complete"
 }
 
 run_full_install() {
   require_full_install_tools
+  show_welcome_banner
+  run_preflight_checks
   detect_firmware_mode
   choose_disk_if_missing
   prompt_install_options
@@ -998,12 +1145,23 @@ run_full_install() {
   confirm "Proceed with installation?" || die "Aborted by user."
 
   partition_and_mount_disk
-  install_arch_base
+  setup_swap_for_target
+  run_archinstall_on_premounted_target
+  ensure_swap_fstab_entry_in_target
   stage_assets_for_chroot
   run_chroot_finalize
 
   msg "Full install finished"
-  echo "You can now reboot into your new system."
+  cat <<EOF
+Installation completed.
+
+Before rebooting, recommended quick checks:
+  - lsblk -f
+  - cat ${TARGET_MNT}/etc/fstab
+  - Ensure boot files exist under ${TARGET_MNT}/boot
+
+Then reboot into your new minimaLinux system.
+EOF
 }
 
 main() {
