@@ -876,8 +876,26 @@ install_bootloader() {
       if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
         grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=minimaLinux --recheck
       else
-        [[ -b "$DISK" ]] || die "Disk not available in chroot for BIOS grub install: ${DISK}"
-        grub-install --target=i386-pc --boot-directory=/boot --recheck "$DISK"
+        local install_disk="$DISK"
+        local parent_kname=""
+
+        if [[ -n "$ROOT_PART" && -b "$ROOT_PART" ]] && command -v lsblk >/dev/null 2>&1; then
+          parent_kname="$(lsblk -no PKNAME "$ROOT_PART" 2>/dev/null | head -n 1 || true)"
+          if [[ -n "$parent_kname" ]]; then
+            install_disk="/dev/${parent_kname}"
+          fi
+        fi
+
+        [[ -b "$install_disk" ]] || die "Disk not available in chroot for BIOS grub install: ${install_disk}"
+
+        grub-install --target=i386-pc --boot-directory=/boot --recheck "$install_disk" \
+          || grub-install --target=i386-pc --boot-directory=/boot --recheck --force "$install_disk"
+
+        if command -v hexdump >/dev/null 2>&1; then
+          local mbr_sig
+          mbr_sig="$(dd if="$install_disk" bs=440 count=1 2>/dev/null | hexdump -ve '1/1 "%02x"' | tr -d '0')"
+          [[ -n "$mbr_sig" ]] || die "MBR boot code appears empty on ${install_disk} after grub-install."
+        fi
       fi
       grub-mkconfig -o /boot/grub/grub.cfg
       [[ -s /boot/grub/grub.cfg ]] || die "GRUB config was not generated."
