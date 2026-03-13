@@ -115,7 +115,7 @@ require_common_tools() {
 }
 
 require_full_install_tools() {
-  command -v archinstall >/dev/null 2>&1 || die "archinstall is required."
+  command -v archinstall >/dev/null 2>&1 || die "Core installer backend is required."
   command -v pacstrap >/dev/null 2>&1 || die "pacstrap is required."
   command -v genfstab >/dev/null 2>&1 || die "genfstab is required."
   command -v arch-chroot >/dev/null 2>&1 || die "arch-chroot is required."
@@ -631,7 +631,7 @@ ensure_swap_fstab_entry_in_target() {
 }
 
 run_archinstall_on_premounted_target() {
-  msg "Running archinstall guided install on pre-mounted target"
+  msg "Running minimaLinux guided core install on pre-mounted target"
 
   local config_file
   local locale_lang
@@ -643,7 +643,7 @@ run_archinstall_on_premounted_target() {
   case "$BOOTLOADER" in
     grub) bootloader_name="Grub" ;;
     systemd-boot) bootloader_name="Systemd-boot" ;;
-    *) die "Unsupported bootloader for archinstall config: ${BOOTLOADER}" ;;
+    *) die "Unsupported bootloader for installer config: ${BOOTLOADER}" ;;
   esac
 
   cat > "$config_file" <<EOF
@@ -1083,6 +1083,59 @@ configure_grub_defaults() {
   fi
 }
 
+apply_minimalinux_bootloader_branding() {
+  msg "Applying minimaLinux bootloader branding"
+
+  case "$BOOTLOADER" in
+    grub)
+      configure_grub_defaults
+      if command -v grub-mkconfig >/dev/null 2>&1 && [[ -d /boot/grub ]]; then
+        grub-mkconfig -o /boot/grub/grub.cfg || warn "Failed to regenerate GRUB config while applying minimaLinux branding"
+      fi
+      ;;
+    systemd-boot)
+      if [[ -d /boot/loader ]]; then
+        local root_uuid
+        local root_ref
+        root_ref=""
+
+        if [[ -n "${ROOT_PART:-}" && -b "$ROOT_PART" ]]; then
+          root_uuid="$(blkid -s PARTUUID -o value "$ROOT_PART" 2>/dev/null || true)"
+          if [[ -n "$root_uuid" ]]; then
+            root_ref="PARTUUID=${root_uuid}"
+          else
+            root_uuid="$(blkid -s UUID -o value "$ROOT_PART" 2>/dev/null || true)"
+            [[ -n "$root_uuid" ]] && root_ref="UUID=${root_uuid}"
+          fi
+        fi
+
+        if [[ -z "$root_ref" ]]; then
+          root_uuid="$(findmnt -no UUID / 2>/dev/null || true)"
+          [[ -n "$root_uuid" ]] && root_ref="UUID=${root_uuid}"
+        fi
+
+        if [[ -z "$root_ref" ]]; then
+          warn "Unable to determine root reference for systemd-boot branding"
+          return
+        fi
+
+        mkdir -p /boot/loader/entries
+        cat > /boot/loader/loader.conf <<EOF
+default minimalinux
+timeout 3
+editor no
+EOF
+        cat > /boot/loader/entries/minimalinux.conf <<EOF
+title minimaLinux
+linux /vmlinuz-linux
+initrd /initramfs-linux.img
+options root=${root_ref} rw
+EOF
+      fi
+      ;;
+  esac
+}
+
 install_bootloader() {
   msg "Installing bootloader: ${BOOTLOADER}"
 
@@ -1189,8 +1242,9 @@ finalize_in_chroot() {
   if [[ "${BOOTLOADER_DONE_BY_ARCHINSTALL:-0}" != "1" ]]; then
     install_bootloader
   else
-    msg "Bootloader was already installed by archinstall; skipping manual bootloader step"
+    msg "Bootloader already installed by guided core installer; skipping manual bootloader step"
   fi
+  apply_minimalinux_bootloader_branding
   msg "Chroot install complete"
 }
 
