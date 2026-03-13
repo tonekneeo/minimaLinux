@@ -778,7 +778,7 @@ set_release_key() {
   local key_name="$2"
   local key_value="$3"
 
-  [[ -f "$file_path" ]] || return
+    [[ -f "$file_path" ]] || return 0
 
   if grep -qE "^${key_name}=" "$file_path"; then
     sed -i -E "s|^${key_name}=.*|${key_name}=${key_value}|" "$file_path"
@@ -850,7 +850,7 @@ install_yay() {
 
 install_aur_packages_with_builder() {
   local -a pkgs=("$@")
-  [[ ${#pkgs[@]} -gt 0 ]] || return
+  [[ ${#pkgs[@]} -gt 0 ]] || return 0
 
   install -d /etc/sudoers.d
   echo 'aurbuilder ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/99-aurbuilder-pacman
@@ -1037,7 +1037,7 @@ install_selected_browser() {
 
 apply_hypr_config_assets() {
   local src="/root/minimalinux-assets/hypr"
-  [[ -d "$src" ]] || return
+  [[ -d "$src" ]] || return 0
 
   if [[ -d "/home/${USERNAME}/.config/hypr" ]] && [[ -n "$(ls -A "/home/${USERNAME}/.config/hypr" 2>/dev/null || true)" ]]; then
     msg "Hypr config already present from repo .config; skipping hypr fallback copy"
@@ -1117,7 +1117,7 @@ configure_grub_defaults() {
 }
 
 rename_uefi_boot_entries_to_minimalinux() {
-  command -v efibootmgr >/dev/null 2>&1 || return
+  command -v efibootmgr >/dev/null 2>&1 || return 0
 
   local line
   local bootnum
