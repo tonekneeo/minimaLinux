@@ -1116,6 +1116,24 @@ configure_grub_defaults() {
   fi
 }
 
+rename_uefi_boot_entries_to_minimalinux() {
+  command -v efibootmgr >/dev/null 2>&1 || return
+
+  local line
+  local bootnum
+
+  while IFS= read -r line; do
+    [[ "$line" =~ ^Boot([0-9A-Fa-f]{4})\*?[[:space:]] ]] || continue
+    bootnum="${BASH_REMATCH[1]}"
+
+    case "$line" in
+      *"Arch Linux"*|*"arch linux"*|*"GRUB"*|*"grub"*)
+        efibootmgr -b "$bootnum" -L "minimaLinux" >/dev/null 2>&1 || true
+        ;;
+    esac
+  done < <(efibootmgr 2>/dev/null || true)
+}
+
 apply_minimalinux_bootloader_branding() {
   msg "Applying minimaLinux bootloader branding"
 
@@ -1126,8 +1144,11 @@ apply_minimalinux_bootloader_branding() {
         grub-mkconfig -o /boot/grub/grub.cfg || warn "Failed to regenerate GRUB config while applying minimaLinux branding"
       fi
       if [[ -f /boot/grub/grub.cfg ]]; then
-        sed -i -E 's/Arch Linux/minimaLinux/g; s/Arch GNU\/Linux/minimaLinux/g' /boot/grub/grub.cfg \
+        sed -i -E 's/Arch Linux/minimaLinux/g; s/arch linux/minimaLinux/g; s/Arch GNU\/Linux/minimaLinux/g; s/arch GNU\/Linux/minimaLinux/g' /boot/grub/grub.cfg \
           || warn "Failed to normalize GRUB menu titles to minimaLinux"
+      fi
+      if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+        rename_uefi_boot_entries_to_minimalinux
       fi
       ;;
     systemd-boot)
@@ -1331,6 +1352,16 @@ Before rebooting, recommended quick checks:
 
 Then reboot into your new minimaLinux system.
 EOF
+
+  if confirm "Reboot now?"; then
+    msg "Preparing to reboot"
+    sync
+    swapoff -a || true
+    umount -R "$TARGET_MNT" >/dev/null 2>&1 || true
+    reboot
+  else
+    msg "Reboot skipped. You can reboot manually when ready."
+  fi
 }
 
 main() {
