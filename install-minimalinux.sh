@@ -15,7 +15,11 @@ TARGET_MNT="/mnt"
 DISK=""
 ROOT_PART=""
 EFI_PART=""
+SWAP_PART=""
 BOOTLOADER="grub"
+FS_TYPE="ext4"
+SWAP_MODE="none"
+SWAP_SIZE_GIB="4"
 GPU_PROFILE="auto"
 BROWSER_CHOICE="firefox"
 HOSTNAME="minimalinux"
@@ -50,6 +54,9 @@ Options:
   --disk <device>          Install target disk (for full-install mode)
   --target-mnt <path>      Mountpoint used during full install (default: /mnt)
   --bootloader <value>     grub | systemd-boot (default: grub)
+  --fs <value>             ext4 | btrfs | xfs (default: ext4)
+  --swap <value>           none | partition | swapfile (default: none)
+  --swap-size <gib>        Swap size in GiB for partition/swapfile (default: 4)
   --hostname <name>
   --username <name>
   --timezone <tz>
@@ -80,7 +87,10 @@ require_full_install_tools() {
   command -v arch-chroot >/dev/null 2>&1 || die "arch-chroot is required."
   command -v parted >/dev/null 2>&1 || die "parted is required."
   command -v mkfs.ext4 >/dev/null 2>&1 || die "mkfs.ext4 is required."
+  command -v mkfs.btrfs >/dev/null 2>&1 || die "mkfs.btrfs is required."
+  command -v mkfs.xfs >/dev/null 2>&1 || die "mkfs.xfs is required."
   command -v mkfs.fat >/dev/null 2>&1 || die "mkfs.fat is required for UEFI installs."
+  command -v mkswap >/dev/null 2>&1 || die "mkswap is required."
   command -v lsblk >/dev/null 2>&1 || die "lsblk is required."
 }
 
@@ -110,6 +120,21 @@ parse_args() {
         shift
         [[ $# -gt 0 ]] || die "Missing value for --bootloader"
         BOOTLOADER="$1"
+        ;;
+      --fs)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --fs"
+        FS_TYPE="$1"
+        ;;
+      --swap)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --swap"
+        SWAP_MODE="$1"
+        ;;
+      --swap-size)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --swap-size"
+        SWAP_SIZE_GIB="$1"
         ;;
       --hostname)
         shift
@@ -206,6 +231,8 @@ prompt_install_options() {
   read -r -p "Username [${USERNAME}]: " choice
   [[ -n "$choice" ]] && USERNAME="$choice"
 
+  prompt_account_passwords
+
   read -r -p "Timezone [${TIMEZONE}] (example: America/New_York): " choice
   [[ -n "$choice" ]] && TIMEZONE="$choice"
 
@@ -227,6 +254,37 @@ prompt_install_options() {
       ;;
     *) die "Invalid bootloader choice: $choice" ;;
   esac
+
+  echo "Filesystem choice:"
+  echo "  1) ext4"
+  echo "  2) btrfs"
+  echo "  3) xfs"
+  read -r -p "Select filesystem [${FS_TYPE}]: " choice
+  case "$choice" in
+    "" ) ;;
+    1|ext4) FS_TYPE="ext4" ;;
+    2|btrfs) FS_TYPE="btrfs" ;;
+    3|xfs) FS_TYPE="xfs" ;;
+    *) die "Invalid filesystem choice: $choice" ;;
+  esac
+
+  echo "Swap choice:"
+  echo "  1) none"
+  echo "  2) partition"
+  echo "  3) swapfile"
+  read -r -p "Select swap mode [${SWAP_MODE}]: " choice
+  case "$choice" in
+    "" ) ;;
+    1|none) SWAP_MODE="none" ;;
+    2|partition) SWAP_MODE="partition" ;;
+    3|swapfile) SWAP_MODE="swapfile" ;;
+    *) die "Invalid swap mode choice: $choice" ;;
+  esac
+
+  if [[ "$SWAP_MODE" != "none" ]]; then
+    read -r -p "Swap size in GiB [${SWAP_SIZE_GIB}]: " choice
+    [[ -n "$choice" ]] && SWAP_SIZE_GIB="$choice"
+  fi
 
   echo "Browser choice:"
   echo "  1) firefox"
@@ -268,23 +326,112 @@ prompt_install_options() {
     *) die "Invalid GPU profile choice: $choice" ;;
   esac
 
+}
+
+prompt_account_passwords() {
+  local confirm_value
+
   while true; do
     read -r -s -p "Set root password: " ROOT_PASSWORD
     echo
-    read -r -s -p "Confirm root password: " choice
+    read -r -s -p "Confirm root password: " confirm_value
     echo
-    [[ "$ROOT_PASSWORD" == "$choice" && -n "$ROOT_PASSWORD" ]] && break
+    [[ "$ROOT_PASSWORD" == "$confirm_value" && -n "$ROOT_PASSWORD" ]] && break
     echo "Passwords did not match. Try again."
   done
 
   while true; do
     read -r -s -p "Set password for ${USERNAME}: " USER_PASSWORD
     echo
-    read -r -s -p "Confirm password for ${USERNAME}: " choice
+    read -r -s -p "Confirm password for ${USERNAME}: " confirm_value
     echo
-    [[ "$USER_PASSWORD" == "$choice" && -n "$USER_PASSWORD" ]] && break
+    [[ "$USER_PASSWORD" == "$confirm_value" && -n "$USER_PASSWORD" ]] && break
     echo "Passwords did not match. Try again."
   done
+}
+
+validate_install_choices() {
+  case "$FS_TYPE" in
+    ext4|btrfs|xfs) ;;
+    *) die "Unsupported filesystem: ${FS_TYPE}" ;;
+  esac
+
+  case "$SWAP_MODE" in
+    none|partition|swapfile) ;;
+    *) die "Unsupported swap mode: ${SWAP_MODE}" ;;
+  esac
+
+  [[ "$SWAP_SIZE_GIB" =~ ^[0-9]+$ ]] || die "Swap size must be a whole number in GiB."
+  [[ "$SWAP_SIZE_GIB" -ge 1 ]] || die "Swap size must be at least 1 GiB."
+}
+
+format_root_filesystem() {
+  case "$FS_TYPE" in
+    ext4)
+      mkfs.ext4 -F "$ROOT_PART"
+      ;;
+    btrfs)
+      mkfs.btrfs -f "$ROOT_PART"
+      ;;
+    xfs)
+      mkfs.xfs -f "$ROOT_PART"
+      ;;
+    *)
+      die "Unsupported filesystem: ${FS_TYPE}"
+      ;;
+  esac
+}
+
+mount_root_filesystem() {
+  case "$FS_TYPE" in
+    btrfs)
+      mount -o compress=zstd:1 "$ROOT_PART" "$TARGET_MNT"
+      ;;
+    *)
+      mount "$ROOT_PART" "$TARGET_MNT"
+      ;;
+  esac
+}
+
+setup_swap_for_target() {
+  case "$SWAP_MODE" in
+    none)
+      return
+      ;;
+    partition)
+      [[ -n "$SWAP_PART" ]] || die "Swap partition mode selected but swap partition not found."
+      mkswap "$SWAP_PART"
+      swapon "$SWAP_PART"
+      ;;
+    swapfile)
+      if [[ "$FS_TYPE" == "btrfs" ]]; then
+        install -d "$TARGET_MNT/swap"
+        chattr +C "$TARGET_MNT/swap" 2>/dev/null || true
+        btrfs property set "$TARGET_MNT/swap" compression none >/dev/null 2>&1 || true
+
+        if command -v btrfs >/dev/null 2>&1 && btrfs filesystem mkswapfile --help >/dev/null 2>&1; then
+          btrfs filesystem mkswapfile --size "${SWAP_SIZE_GIB}g" "$TARGET_MNT/swap/swapfile"
+        else
+          truncate -s 0 "$TARGET_MNT/swap/swapfile"
+          chattr +C "$TARGET_MNT/swap/swapfile" 2>/dev/null || true
+          dd if=/dev/zero of="$TARGET_MNT/swap/swapfile" bs=1M count=$((SWAP_SIZE_GIB * 1024)) status=progress
+          chmod 600 "$TARGET_MNT/swap/swapfile"
+          mkswap "$TARGET_MNT/swap/swapfile"
+        fi
+
+        chmod 600 "$TARGET_MNT/swap/swapfile"
+        swapon "$TARGET_MNT/swap/swapfile"
+      else
+        fallocate -l "${SWAP_SIZE_GIB}G" "$TARGET_MNT/swapfile" 2>/dev/null || dd if=/dev/zero of="$TARGET_MNT/swapfile" bs=1M count=$((SWAP_SIZE_GIB * 1024)) status=progress
+        chmod 600 "$TARGET_MNT/swapfile"
+        mkswap "$TARGET_MNT/swapfile"
+        swapon "$TARGET_MNT/swapfile"
+      fi
+      ;;
+    *)
+      die "Unsupported swap mode: ${SWAP_MODE}"
+      ;;
+  esac
 }
 
 partition_and_mount_disk() {
@@ -301,23 +448,44 @@ partition_and_mount_disk() {
     parted -s "$DISK" mklabel gpt
     parted -s "$DISK" mkpart ESP fat32 1MiB 1025MiB
     parted -s "$DISK" set 1 esp on
-    parted -s "$DISK" mkpart primary ext4 1025MiB 100%
+    if [[ "$SWAP_MODE" == "partition" ]]; then
+      parted -s "$DISK" mkpart primary ext4 1025MiB "-$((SWAP_SIZE_GIB))GiB"
+      parted -s "$DISK" mkpart primary linux-swap "-$((SWAP_SIZE_GIB))GiB" 100%
+    else
+      parted -s "$DISK" mkpart primary ext4 1025MiB 100%
+    fi
+    partprobe "$DISK" || true
+    udevadm settle || true
     EFI_PART="$(partition_path "$DISK" 1)"
     ROOT_PART="$(partition_path "$DISK" 2)"
+    if [[ "$SWAP_MODE" == "partition" ]]; then
+      SWAP_PART="$(partition_path "$DISK" 3)"
+    fi
 
     mkfs.fat -F32 "$EFI_PART"
-    mkfs.ext4 -F "$ROOT_PART"
+    format_root_filesystem
 
-    mount "$ROOT_PART" "$TARGET_MNT"
+    mount_root_filesystem
     mkdir -p "$TARGET_MNT/boot"
     mount "$EFI_PART" "$TARGET_MNT/boot"
   else
     parted -s "$DISK" mklabel msdos
-    parted -s "$DISK" mkpart primary ext4 1MiB 100%
+    if [[ "$SWAP_MODE" == "partition" ]]; then
+      parted -s "$DISK" mkpart primary ext4 1MiB "-$((SWAP_SIZE_GIB))GiB"
+      parted -s "$DISK" mkpart primary linux-swap "-$((SWAP_SIZE_GIB))GiB" 100%
+    else
+      parted -s "$DISK" mkpart primary ext4 1MiB 100%
+    fi
+    parted -s "$DISK" set 1 boot on
+    partprobe "$DISK" || true
+    udevadm settle || true
     ROOT_PART="$(partition_path "$DISK" 1)"
+    if [[ "$SWAP_MODE" == "partition" ]]; then
+      SWAP_PART="$(partition_path "$DISK" 2)"
+    fi
 
-    mkfs.ext4 -F "$ROOT_PART"
-    mount "$ROOT_PART" "$TARGET_MNT"
+    format_root_filesystem
+    mount_root_filesystem
   fi
 }
 
@@ -325,12 +493,29 @@ install_arch_base() {
   msg "Installing Arch base system"
 
   local base_pkgs=(base linux linux-firmware sudo networkmanager grub)
+  if [[ "$FS_TYPE" == "btrfs" ]]; then
+    base_pkgs+=(btrfs-progs)
+  elif [[ "$FS_TYPE" == "xfs" ]]; then
+    base_pkgs+=(xfsprogs)
+  fi
   if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
     base_pkgs+=(efibootmgr dosfstools mtools)
   fi
 
   pacstrap -K "$TARGET_MNT" "${base_pkgs[@]}"
+  setup_swap_for_target
   genfstab -U "$TARGET_MNT" > "$TARGET_MNT/etc/fstab"
+
+  if [[ "$SWAP_MODE" == "swapfile" ]]; then
+    local swapfile_path="/swapfile"
+    if [[ "$FS_TYPE" == "btrfs" ]]; then
+      swapfile_path="/swap/swapfile"
+    fi
+
+    if ! grep -qE "^[^#].*${swapfile_path//\//\\/}[[:space:]]+none[[:space:]]+swap" "$TARGET_MNT/etc/fstab"; then
+      echo "${swapfile_path} none swap defaults 0 0" >> "$TARGET_MNT/etc/fstab"
+    fi
+  fi
 }
 
 write_install_env() {
@@ -338,7 +523,11 @@ write_install_env() {
 DISK='${DISK}'
 ROOT_PART='${ROOT_PART}'
 EFI_PART='${EFI_PART}'
+SWAP_PART='${SWAP_PART}'
 BOOTLOADER='${BOOTLOADER}'
+FS_TYPE='${FS_TYPE}'
+SWAP_MODE='${SWAP_MODE}'
+SWAP_SIZE_GIB='${SWAP_SIZE_GIB}'
 GPU_PROFILE='${GPU_PROFILE}'
 BROWSER_CHOICE='${BROWSER_CHOICE}'
 HOSTNAME='${HOSTNAME}'
@@ -688,9 +877,11 @@ install_bootloader() {
         grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=minimaLinux --recheck
       else
         [[ -b "$DISK" ]] || die "Disk not available in chroot for BIOS grub install: ${DISK}"
-        grub-install --target=i386-pc --recheck "$DISK"
+        grub-install --target=i386-pc --boot-directory=/boot --recheck "$DISK"
       fi
       grub-mkconfig -o /boot/grub/grub.cfg
+      [[ -s /boot/grub/grub.cfg ]] || die "GRUB config was not generated."
+      [[ -f /boot/grub/i386-pc/core.img || "$FIRMWARE_MODE" == "uefi" ]] || die "GRUB BIOS core image missing; bootloader install failed."
       ;;
     systemd-boot)
       [[ "$FIRMWARE_MODE" == "uefi" ]] || die "systemd-boot requires UEFI mode"
@@ -757,11 +948,17 @@ run_full_install() {
   detect_firmware_mode
   choose_disk_if_missing
   prompt_install_options
+  validate_install_choices
 
   msg "Install summary"
   echo "Disk:       ${DISK}"
   echo "Firmware:   ${FIRMWARE_MODE}"
   echo "Bootloader: ${BOOTLOADER}"
+  echo "Filesystem: ${FS_TYPE}"
+  echo "Swap mode:  ${SWAP_MODE}"
+  if [[ "$SWAP_MODE" != "none" ]]; then
+    echo "Swap size:  ${SWAP_SIZE_GIB} GiB"
+  fi
   echo "Hostname:   ${HOSTNAME}"
   echo "Username:   ${USERNAME}"
   echo "Timezone:   ${TIMEZONE}"
