@@ -1,0 +1,807 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+export LC_MESSAGES=C
+export LANG=C
+
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+LOG_DIR="/var/log"
+LOG_FILE="${LOG_DIR}/minimalinux-install-$(date +%Y%m%d-%H%M%S).log"
+
+MODE="full-install"
+TARGET_MNT="/mnt"
+DISK=""
+ROOT_PART=""
+EFI_PART=""
+BOOTLOADER="grub"
+GPU_PROFILE="auto"
+BROWSER_CHOICE="firefox"
+HOSTNAME="minimalinux"
+TIMEZONE="UTC"
+LOCALE="en_US.UTF-8"
+USERNAME="user"
+USER_PASSWORD=""
+ROOT_PASSWORD=""
+FIRMWARE_MODE=""
+
+msg() {
+  printf "\n==> %s\n" "$1"
+}
+
+die() {
+  printf "\nERROR: %s\n" "$1" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  $(basename "$0")
+  $(basename "$0") --disk /dev/nvme0n1 --bootloader grub --hostname minimalinux --username tonekneeo
+  $(basename "$0") --provision-existing
+
+Modes:
+  default full-install     Full install: partition disk, install base Arch, install bootloader, provision minimaLinux stack.
+  --provision-existing     Skip partition/base install; provision minimaLinux stack on current system.
+
+Options:
+  --disk <device>          Install target disk (for full-install mode)
+  --target-mnt <path>      Mountpoint used during full install (default: /mnt)
+  --bootloader <value>     grub | systemd-boot (default: grub)
+  --hostname <name>
+  --username <name>
+  --timezone <tz>
+  --locale <locale>
+  --browser <value>        firefox | chromium | vivaldi | brave | zen | none
+  --gpu <value>            auto | amd | intel | nouveau | nvidia-open | nvidia-proprietary | all-open
+  -h, --help
+EOF
+}
+
+init_logging() {
+  mkdir -p "$LOG_DIR"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+}
+
+require_root() {
+  [[ "$EUID" -eq 0 ]] || die "Run this script as root."
+}
+
+require_common_tools() {
+  command -v pacman >/dev/null 2>&1 || die "pacman is required."
+  command -v systemctl >/dev/null 2>&1 || die "systemctl is required."
+}
+
+require_full_install_tools() {
+  command -v pacstrap >/dev/null 2>&1 || die "pacstrap is required."
+  command -v genfstab >/dev/null 2>&1 || die "genfstab is required."
+  command -v arch-chroot >/dev/null 2>&1 || die "arch-chroot is required."
+  command -v parted >/dev/null 2>&1 || die "parted is required."
+  command -v mkfs.ext4 >/dev/null 2>&1 || die "mkfs.ext4 is required."
+  command -v mkfs.fat >/dev/null 2>&1 || die "mkfs.fat is required for UEFI installs."
+  command -v lsblk >/dev/null 2>&1 || die "lsblk is required."
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provision-existing)
+        MODE="provision-existing"
+        ;;
+      --chroot-finalize)
+        MODE="chroot-finalize"
+        shift
+        [[ $# -gt 0 ]] || die "Missing env file path for --chroot-finalize"
+        ENV_FILE="$1"
+        ;;
+      --disk)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --disk"
+        DISK="$1"
+        ;;
+      --target-mnt)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --target-mnt"
+        TARGET_MNT="$1"
+        ;;
+      --bootloader)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --bootloader"
+        BOOTLOADER="$1"
+        ;;
+      --hostname)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --hostname"
+        HOSTNAME="$1"
+        ;;
+      --username)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --username"
+        USERNAME="$1"
+        ;;
+      --timezone)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --timezone"
+        TIMEZONE="$1"
+        ;;
+      --locale)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --locale"
+        LOCALE="$1"
+        ;;
+      --browser)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --browser"
+        BROWSER_CHOICE="$1"
+        ;;
+      --gpu)
+        shift
+        [[ $# -gt 0 ]] || die "Missing value for --gpu"
+        GPU_PROFILE="$1"
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+    shift
+  done
+}
+
+confirm() {
+  local prompt="$1"
+  local answer
+  while true; do
+    read -r -p "$prompt [y/N]: " answer
+    case "$answer" in
+      y|Y|yes|YES) return 0 ;;
+      n|N|no|NO|"") return 1 ;;
+      *) echo "Please answer y or n." ;;
+    esac
+  done
+}
+
+detect_firmware_mode() {
+  if [[ -d /sys/firmware/efi/efivars ]]; then
+    FIRMWARE_MODE="uefi"
+  else
+    FIRMWARE_MODE="bios"
+  fi
+}
+
+partition_path() {
+  local disk="$1"
+  local number="$2"
+  if [[ "$disk" =~ (nvme|mmcblk|loop) ]]; then
+    echo "${disk}p${number}"
+  else
+    echo "${disk}${number}"
+  fi
+}
+
+choose_disk_if_missing() {
+  if [[ -n "$DISK" ]]; then
+    [[ -b "$DISK" ]] || die "Disk not found: $DISK"
+    return
+  fi
+
+  msg "Available block devices"
+  lsblk -d -o NAME,SIZE,MODEL,TYPE
+  echo
+  read -r -p "Enter install disk (example: /dev/nvme0n1): " DISK
+  [[ -b "$DISK" ]] || die "Disk not found: $DISK"
+}
+
+prompt_install_options() {
+  local choice
+
+  read -r -p "Hostname [${HOSTNAME}]: " choice
+  [[ -n "$choice" ]] && HOSTNAME="$choice"
+
+  read -r -p "Username [${USERNAME}]: " choice
+  [[ -n "$choice" ]] && USERNAME="$choice"
+
+  read -r -p "Timezone [${TIMEZONE}] (example: America/New_York): " choice
+  [[ -n "$choice" ]] && TIMEZONE="$choice"
+
+  read -r -p "Locale [${LOCALE}] (example: en_US.UTF-8): " choice
+  [[ -n "$choice" ]] && LOCALE="$choice"
+
+  echo "Bootloader choice:"
+  echo "  1) grub"
+  if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+    echo "  2) systemd-boot"
+  fi
+  read -r -p "Select bootloader [${BOOTLOADER}]: " choice
+  case "$choice" in
+    "" ) ;;
+    1|grub) BOOTLOADER="grub" ;;
+    2|systemd-boot)
+      [[ "$FIRMWARE_MODE" == "uefi" ]] || die "systemd-boot requires UEFI firmware mode."
+      BOOTLOADER="systemd-boot"
+      ;;
+    *) die "Invalid bootloader choice: $choice" ;;
+  esac
+
+  echo "Browser choice:"
+  echo "  1) firefox"
+  echo "  2) chromium"
+  echo "  3) vivaldi"
+  echo "  4) brave"
+  echo "  5) zen"
+  echo "  6) none"
+  read -r -p "Select browser [${BROWSER_CHOICE}]: " choice
+  case "$choice" in
+    "" ) ;;
+    1|firefox) BROWSER_CHOICE="firefox" ;;
+    2|chromium) BROWSER_CHOICE="chromium" ;;
+    3|vivaldi) BROWSER_CHOICE="vivaldi" ;;
+    4|brave) BROWSER_CHOICE="brave" ;;
+    5|zen) BROWSER_CHOICE="zen" ;;
+    6|none) BROWSER_CHOICE="none" ;;
+    *) die "Invalid browser choice: $choice" ;;
+  esac
+
+  echo "GPU profile:"
+  echo "  1) auto"
+  echo "  2) amd"
+  echo "  3) intel"
+  echo "  4) nouveau"
+  echo "  5) nvidia-open"
+  echo "  6) nvidia-proprietary"
+  echo "  7) all-open"
+  read -r -p "Select GPU profile [${GPU_PROFILE}]: " choice
+  case "$choice" in
+    "" ) ;;
+    1|auto) GPU_PROFILE="auto" ;;
+    2|amd) GPU_PROFILE="amd" ;;
+    3|intel) GPU_PROFILE="intel" ;;
+    4|nouveau) GPU_PROFILE="nouveau" ;;
+    5|nvidia-open) GPU_PROFILE="nvidia-open" ;;
+    6|nvidia-proprietary) GPU_PROFILE="nvidia-proprietary" ;;
+    7|all-open) GPU_PROFILE="all-open" ;;
+    *) die "Invalid GPU profile choice: $choice" ;;
+  esac
+
+  while true; do
+    read -r -s -p "Set root password: " ROOT_PASSWORD
+    echo
+    read -r -s -p "Confirm root password: " choice
+    echo
+    [[ "$ROOT_PASSWORD" == "$choice" && -n "$ROOT_PASSWORD" ]] && break
+    echo "Passwords did not match. Try again."
+  done
+
+  while true; do
+    read -r -s -p "Set password for ${USERNAME}: " USER_PASSWORD
+    echo
+    read -r -s -p "Confirm password for ${USERNAME}: " choice
+    echo
+    [[ "$USER_PASSWORD" == "$choice" && -n "$USER_PASSWORD" ]] && break
+    echo "Passwords did not match. Try again."
+  done
+}
+
+partition_and_mount_disk() {
+  msg "Partitioning disk: ${DISK}"
+
+  if ! confirm "This will erase all data on ${DISK}. Continue?"; then
+    die "Aborted by user."
+  fi
+
+  swapoff -a || true
+  umount -R "$TARGET_MNT" >/dev/null 2>&1 || true
+
+  if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+    parted -s "$DISK" mklabel gpt
+    parted -s "$DISK" mkpart ESP fat32 1MiB 1025MiB
+    parted -s "$DISK" set 1 esp on
+    parted -s "$DISK" mkpart primary ext4 1025MiB 100%
+    EFI_PART="$(partition_path "$DISK" 1)"
+    ROOT_PART="$(partition_path "$DISK" 2)"
+
+    mkfs.fat -F32 "$EFI_PART"
+    mkfs.ext4 -F "$ROOT_PART"
+
+    mount "$ROOT_PART" "$TARGET_MNT"
+    mkdir -p "$TARGET_MNT/boot"
+    mount "$EFI_PART" "$TARGET_MNT/boot"
+  else
+    parted -s "$DISK" mklabel msdos
+    parted -s "$DISK" mkpart primary ext4 1MiB 100%
+    ROOT_PART="$(partition_path "$DISK" 1)"
+
+    mkfs.ext4 -F "$ROOT_PART"
+    mount "$ROOT_PART" "$TARGET_MNT"
+  fi
+}
+
+install_arch_base() {
+  msg "Installing Arch base system"
+
+  local base_pkgs=(base linux linux-firmware sudo networkmanager grub)
+  if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+    base_pkgs+=(efibootmgr dosfstools mtools)
+  fi
+
+  pacstrap -K "$TARGET_MNT" "${base_pkgs[@]}"
+  genfstab -U "$TARGET_MNT" > "$TARGET_MNT/etc/fstab"
+}
+
+write_install_env() {
+  cat > "$TARGET_MNT/root/minimalinux-install.env" <<EOF
+DISK='${DISK}'
+ROOT_PART='${ROOT_PART}'
+EFI_PART='${EFI_PART}'
+BOOTLOADER='${BOOTLOADER}'
+GPU_PROFILE='${GPU_PROFILE}'
+BROWSER_CHOICE='${BROWSER_CHOICE}'
+HOSTNAME='${HOSTNAME}'
+TIMEZONE='${TIMEZONE}'
+LOCALE='${LOCALE}'
+USERNAME='${USERNAME}'
+USER_PASSWORD='${USER_PASSWORD}'
+ROOT_PASSWORD='${ROOT_PASSWORD}'
+FIRMWARE_MODE='${FIRMWARE_MODE}'
+EOF
+  chmod 600 "$TARGET_MNT/root/minimalinux-install.env"
+}
+
+stage_assets_for_chroot() {
+  msg "Staging installer assets in target root"
+  cp "$SCRIPT_PATH" "$TARGET_MNT/root/install-minimalinux.sh"
+  chmod +x "$TARGET_MNT/root/install-minimalinux.sh"
+
+  install -d "$TARGET_MNT/root/minimalinux-assets"
+  if [[ -d "$SCRIPT_DIR/hypr" ]]; then
+    cp -a "$SCRIPT_DIR/hypr" "$TARGET_MNT/root/minimalinux-assets/"
+  fi
+
+  write_install_env
+}
+
+run_chroot_finalize() {
+  msg "Running chroot configuration"
+  arch-chroot "$TARGET_MNT" /root/install-minimalinux.sh --chroot-finalize /root/minimalinux-install.env
+}
+
+configure_base_system() {
+  msg "Configuring base system"
+
+  [[ -f "/usr/share/zoneinfo/${TIMEZONE}" ]] || die "Timezone not found: ${TIMEZONE}"
+  ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+  hwclock --systohc
+
+  sed -i -E "s|^#(${LOCALE}[[:space:]]+UTF-8)|\1|" /etc/locale.gen || true
+  grep -Eq "^${LOCALE}[[:space:]]+UTF-8" /etc/locale.gen || echo "${LOCALE} UTF-8" >> /etc/locale.gen
+  locale-gen
+  echo "LANG=${LOCALE}" > /etc/locale.conf
+
+  echo "$HOSTNAME" > /etc/hostname
+  cat > /etc/hosts <<EOF
+127.0.0.1 localhost
+::1       localhost
+127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
+EOF
+
+  echo "root:${ROOT_PASSWORD}" | chpasswd
+
+  if ! id -u "$USERNAME" >/dev/null 2>&1; then
+    useradd -m -G wheel -s /bin/bash "$USERNAME"
+  fi
+  echo "${USERNAME}:${USER_PASSWORD}" | chpasswd
+
+  sed -i -E 's|^# %wheel ALL=\(ALL:ALL\) ALL|%wheel ALL=(ALL:ALL) ALL|' /etc/sudoers
+}
+
+ensure_multilib() {
+  msg "Ensuring multilib is enabled"
+  if ! grep -Eq '^[[:space:]]*\[multilib\][[:space:]]*$' /etc/pacman.conf; then
+    if grep -Eq '^[[:space:]]*#\[multilib\][[:space:]]*$' /etc/pacman.conf; then
+      sed -i -E '/^[[:space:]]*#\[multilib\][[:space:]]*$/,/^[[:space:]]*#Include[[:space:]]*=[[:space:]]*\/etc\/pacman\.d\/mirrorlist[[:space:]]*$/ s/^[[:space:]]*#//' /etc/pacman.conf
+    else
+      printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
+    fi
+  fi
+}
+
+setup_chaotic_aur() {
+  msg "Configuring Chaotic-AUR"
+
+  if ! grep -Fq '[chaotic-aur]' /etc/pacman.conf; then
+    pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com
+    pacman-key --lsign-key 3056513887B78AEB
+    pacman -U --noconfirm https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst
+    pacman -U --noconfirm https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst
+  fi
+
+  sed -i '/^\[chaotic-aur\]/,/^$/d' /etc/pacman.conf
+  printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' >> /etc/pacman.conf
+
+  pacman -Syy
+}
+
+install_yay() {
+  msg "Installing yay"
+  if command -v yay >/dev/null 2>&1; then
+    return
+  fi
+
+  pacman -S --noconfirm --needed base-devel git go
+  id -u aurbuilder >/dev/null 2>&1 || useradd -m -s /usr/bin/bash aurbuilder
+  rm -rf /tmp/yay-aur
+  install -d -o aurbuilder -g aurbuilder /tmp/yay-aur
+
+  runuser -u aurbuilder -- bash -lc '
+    set -euo pipefail
+    cd /tmp/yay-aur
+    git clone --depth 1 https://aur.archlinux.org/yay.git .
+    makepkg --noconfirm --needed
+  '
+
+  local pkg_file
+  pkg_file="$(find /tmp/yay-aur -maxdepth 1 -type f -name 'yay-*.pkg.tar.*' ! -name '*-debug-*' | head -n 1)"
+  [[ -n "$pkg_file" ]] || die "Failed to build yay package."
+  pacman -U --noconfirm "$pkg_file"
+}
+
+install_aur_packages_with_builder() {
+  local -a pkgs=("$@")
+  [[ ${#pkgs[@]} -gt 0 ]] || return
+
+  install -d /etc/sudoers.d
+  echo 'aurbuilder ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/99-aurbuilder-pacman
+  chmod 440 /etc/sudoers.d/99-aurbuilder-pacman
+
+  runuser -u aurbuilder -- env HOME=/home/aurbuilder bash -lc "yay -S --noconfirm --needed ${pkgs[*]}"
+
+  rm -f /etc/sudoers.d/99-aurbuilder-pacman
+}
+
+cleanup_yay_build_user() {
+  msg "Cleaning yay build artifacts"
+  rm -rf /tmp/yay-aur
+  if id -u aurbuilder >/dev/null 2>&1; then
+    userdel -r aurbuilder >/dev/null 2>&1 || userdel aurbuilder >/dev/null 2>&1 || true
+  fi
+}
+
+install_core_packages() {
+  msg "Installing core packages"
+  pacman -S --noconfirm --needed \
+    polkit-gnome gnome-keyring hyprlock hypridle pavucontrol playerctl wlsunset fish fastfetch \
+    bluez bluez-utils blueman xdg-desktop-portal-gtk xdg-user-dirs power-profiles-daemon upower flatpak
+}
+
+install_ui_packages() {
+  msg "Installing UI and desktop utility packages"
+  pacman -S --noconfirm --needed \
+    satty grim slurp hyprshot nwg-look nwg-displays hyprland-protocols qt6ct matugen adw-gtk-theme \
+    yaru-icon-theme humanity-icon-theme bibata-cursor-theme gcolor3 loupe kitty-shell-integration \
+    kitty-terminfo gpu-screen-recorder
+}
+
+install_app_packages() {
+  msg "Installing app and filesystem packages"
+  pacman -S --noconfirm --needed \
+    thunar thunar-media-tags-plugin thunar-shares-plugin thunar-vcs-plugin thunar-volman \
+    thunar-archive-plugin gnome-disk-utility gedit obsidian gnome-calculator file-roller unrar unzip \
+    7zip tumbler libopenraw libgsf poppler-glib ffmpegthumbnailer freetype2 libgepub gvfs ntfs-3g \
+    dosfstools exfatprogs starship cava easyeffects lsp-plugins-lv2 calf cpupower update-grub
+}
+
+install_hyprland_stack() {
+  msg "Installing Arch Hyprland baseline stack"
+  if pacman -Q jack2 >/dev/null 2>&1; then
+    pacman -R --noconfirm jack2 || pacman -Rdd --noconfirm jack2
+  fi
+
+  pacman -S --noconfirm --needed \
+    hyprland dunst kitty uwsm dolphin wofi xdg-desktop-portal-hyprland qt5-wayland qt6-wayland \
+    polkit-kde-agent grim slurp xorg-server nano vim openssh htop wget iwd wireless_tools smartmontools \
+    xdg-utils pipewire pipewire-alsa pipewire-pulse pipewire-jack gst-plugin-pipewire libpulse wireplumber
+}
+
+install_dev_packages() {
+  msg "Installing developer packages"
+  pacman -S --noconfirm --needed base-devel clang cmake go rust pkgconf meson ninja ddcutil
+}
+
+install_gaming_packages() {
+  msg "Installing gaming and streaming packages"
+  pacman -S --noconfirm --needed \
+    steam mangohud lib32-mangohud wine winetricks protontricks lutris heroic-games-launcher-bin \
+    jdk21-openjdk ttf-ms-fonts obs-studio-stable
+}
+
+package_available() {
+  pacman -Si "$1" >/dev/null 2>&1
+}
+
+detect_gpu_vendors() {
+  local vendors=""
+  local vendor_id
+  for vfile in /sys/class/drm/card*/device/vendor; do
+    [[ -f "$vfile" ]] || continue
+    vendor_id="$(tr '[:upper:]' '[:lower:]' < "$vfile")"
+    case "$vendor_id" in
+      0x10de) [[ " $vendors " == *" nvidia "* ]] || vendors="$vendors nvidia" ;;
+      0x1002|0x1022) [[ " $vendors " == *" amd "* ]] || vendors="$vendors amd" ;;
+      0x8086) [[ " $vendors " == *" intel "* ]] || vendors="$vendors intel" ;;
+    esac
+  done
+  echo "$vendors"
+}
+
+install_gpu_profile() {
+  msg "Installing GPU drivers/profile: ${GPU_PROFILE}"
+
+  local profile="$GPU_PROFILE"
+  local vendors
+  local -a pkgs=()
+
+  vendors="$(detect_gpu_vendors)"
+
+  pkgs+=(mesa vulkan-icd-loader libva-mesa-driver lib32-mesa lib32-vulkan-icd-loader lib32-libva)
+
+  if [[ "$profile" == "auto" ]]; then
+    if [[ " $vendors " == *" amd "* ]]; then
+      profile="amd"
+    elif [[ " $vendors " == *" intel "* ]]; then
+      profile="intel"
+    elif [[ " $vendors " == *" nvidia "* ]]; then
+      profile="nvidia-proprietary"
+    else
+      profile="all-open"
+    fi
+  fi
+
+  case "$profile" in
+    amd)
+      pkgs+=(vulkan-radeon lib32-vulkan-radeon)
+      ;;
+    intel)
+      pkgs+=(vulkan-intel lib32-vulkan-intel intel-media-driver)
+      ;;
+    nouveau)
+      pkgs+=(vulkan-nouveau lib32-vulkan-nouveau)
+      ;;
+    nvidia-open)
+      if package_available nvidia-open-dkms; then
+        pkgs+=(nvidia-open-dkms)
+      elif package_available nvidia-open; then
+        pkgs+=(nvidia-open)
+      fi
+      pkgs+=(nvidia-utils lib32-nvidia-utils nvidia-settings libva-nvidia-driver)
+      ;;
+    nvidia-proprietary)
+      if package_available nvidia-dkms; then
+        pkgs+=(nvidia-dkms)
+      elif package_available nvidia; then
+        pkgs+=(nvidia)
+      elif package_available nvidia-open-dkms; then
+        pkgs+=(nvidia-open-dkms)
+      fi
+      pkgs+=(nvidia-utils lib32-nvidia-utils nvidia-settings libva-nvidia-driver)
+      ;;
+    all-open)
+      pkgs+=(vulkan-radeon lib32-vulkan-radeon vulkan-intel lib32-vulkan-intel intel-media-driver vulkan-nouveau lib32-vulkan-nouveau)
+      ;;
+    *)
+      die "Unsupported GPU profile: $profile"
+      ;;
+  esac
+
+  pacman -S --noconfirm --needed "${pkgs[@]}"
+
+  if [[ "$profile" == nvidia* ]]; then
+    install -d /etc/modprobe.d
+    echo "options nvidia_drm modeset=1" > /etc/modprobe.d/nvidia-drm.conf
+  fi
+}
+
+install_minimalinux_extras() {
+  msg "Installing minimaLinux extras"
+  pacman -S --noconfirm --needed noctalia-shell noctalia-qs || true
+  install_aur_packages_with_builder upscayl-desktop-git video-downloader mission-center protonplus deadbeef
+}
+
+install_selected_browser() {
+  msg "Installing browser choice: ${BROWSER_CHOICE}"
+  case "$BROWSER_CHOICE" in
+    firefox)
+      pacman -S --noconfirm --needed firefox
+      ;;
+    chromium)
+      pacman -S --noconfirm --needed chromium
+      ;;
+    vivaldi)
+      pacman -S --noconfirm --needed vivaldi || install_aur_packages_with_builder vivaldi
+      ;;
+    brave)
+      pacman -S --noconfirm --needed brave-bin || install_aur_packages_with_builder brave-bin
+      ;;
+    zen)
+      pacman -S --noconfirm --needed zen-browser-bin || install_aur_packages_with_builder zen-browser-bin
+      ;;
+    none)
+      ;;
+    *)
+      die "Unsupported browser choice: ${BROWSER_CHOICE}"
+      ;;
+  esac
+}
+
+apply_hypr_config_assets() {
+  local src="/root/minimalinux-assets/hypr"
+  [[ -d "$src" ]] || return
+
+  msg "Applying Hypr config assets for ${USERNAME}"
+  install -d "/home/${USERNAME}/.config/hypr"
+  cp -a "$src"/* "/home/${USERNAME}/.config/hypr/"
+  chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
+
+  if [[ -d "/home/${USERNAME}/.config/hypr/Scripts" ]]; then
+    find "/home/${USERNAME}/.config/hypr/Scripts" -type f -exec chmod +x {} \;
+  fi
+}
+
+setup_i2c() {
+  msg "Configuring i2c-dev"
+  modprobe i2c-dev || true
+  echo i2c-dev > /etc/modules-load.d/i2c-dev.conf
+  usermod -aG i2c "$USERNAME" || true
+}
+
+setup_services() {
+  msg "Enabling services"
+  pacman -S --noconfirm --needed networkmanager wpa_supplicant network-manager-applet sddm
+  systemctl enable NetworkManager.service
+  systemctl enable sddm
+  systemctl enable bluetooth
+  systemctl set-default graphical.target
+}
+
+configure_grub_defaults() {
+  local defaults="/etc/default/grub"
+  if [[ -f "$defaults" ]]; then
+    if grep -qE '^GRUB_DISTRIBUTOR=' "$defaults"; then
+      sed -i -E 's|^GRUB_DISTRIBUTOR=.*|GRUB_DISTRIBUTOR="minimaLinux"|' "$defaults"
+    else
+      echo 'GRUB_DISTRIBUTOR="minimaLinux"' >> "$defaults"
+    fi
+  fi
+}
+
+install_bootloader() {
+  msg "Installing bootloader: ${BOOTLOADER}"
+
+  case "$BOOTLOADER" in
+    grub)
+      configure_grub_defaults
+      if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+        grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=minimaLinux --recheck
+      else
+        [[ -b "$DISK" ]] || die "Disk not available in chroot for BIOS grub install: ${DISK}"
+        grub-install --target=i386-pc --recheck "$DISK"
+      fi
+      grub-mkconfig -o /boot/grub/grub.cfg
+      ;;
+    systemd-boot)
+      [[ "$FIRMWARE_MODE" == "uefi" ]] || die "systemd-boot requires UEFI mode"
+      bootctl install
+      mkdir -p /boot/loader/entries
+      cat > /boot/loader/loader.conf <<EOF
+default minimalinux
+timeout 3
+editor no
+EOF
+      local root_uuid
+      local root_ref
+      root_uuid="$(blkid -s PARTUUID -o value "$ROOT_PART" 2>/dev/null || true)"
+      if [[ -n "$root_uuid" ]]; then
+        root_ref="PARTUUID=${root_uuid}"
+      else
+        root_uuid="$(blkid -s UUID -o value "$ROOT_PART")"
+        root_ref="UUID=${root_uuid}"
+      fi
+      cat > /boot/loader/entries/minimalinux.conf <<EOF
+title minimaLinux
+linux /vmlinuz-linux
+initrd /initramfs-linux.img
+    options root=${root_ref} rw
+EOF
+      ;;
+    *)
+      die "Unsupported bootloader: ${BOOTLOADER}"
+      ;;
+  esac
+}
+
+provision_minimalinux_stack() {
+  require_common_tools
+  ensure_multilib
+  setup_chaotic_aur
+  install_yay
+  install_core_packages
+  install_ui_packages
+  install_app_packages
+  install_hyprland_stack
+  install_dev_packages
+  install_gaming_packages
+  install_gpu_profile
+  install_minimalinux_extras
+  install_selected_browser
+  setup_i2c
+  setup_services
+  cleanup_yay_build_user
+}
+
+finalize_in_chroot() {
+  [[ -f "${ENV_FILE}" ]] || die "Env file not found: ${ENV_FILE}"
+  source "${ENV_FILE}"
+  configure_base_system
+  provision_minimalinux_stack
+  apply_hypr_config_assets
+  install_bootloader
+  msg "Chroot install complete"
+}
+
+run_full_install() {
+  require_full_install_tools
+  detect_firmware_mode
+  choose_disk_if_missing
+  prompt_install_options
+
+  msg "Install summary"
+  echo "Disk:       ${DISK}"
+  echo "Firmware:   ${FIRMWARE_MODE}"
+  echo "Bootloader: ${BOOTLOADER}"
+  echo "Hostname:   ${HOSTNAME}"
+  echo "Username:   ${USERNAME}"
+  echo "Timezone:   ${TIMEZONE}"
+  echo "Locale:     ${LOCALE}"
+  echo "Browser:    ${BROWSER_CHOICE}"
+  echo "GPU:        ${GPU_PROFILE}"
+
+  confirm "Proceed with installation?" || die "Aborted by user."
+
+  partition_and_mount_disk
+  install_arch_base
+  stage_assets_for_chroot
+  run_chroot_finalize
+
+  msg "Full install finished"
+  echo "You can now reboot into your new system."
+}
+
+main() {
+  parse_args "$@"
+
+  require_root
+  init_logging
+
+  msg "Log file: ${LOG_FILE}"
+
+  case "$MODE" in
+    full-install)
+      run_full_install
+      ;;
+    provision-existing)
+      provision_minimalinux_stack
+      ;;
+    chroot-finalize)
+      finalize_in_chroot
+      ;;
+    *)
+      die "Unsupported mode: $MODE"
+      ;;
+  esac
+}
+
+main "$@"
