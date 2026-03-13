@@ -216,7 +216,7 @@ confirm() {
   local prompt="$1"
   local answer
   while true; do
-    read -r -p "$prompt [y/N]: " answer
+    read -r -p "$prompt [y/N]: " answer </dev/tty || return 1
     case "$answer" in
       y|Y|yes|YES) return 0 ;;
       n|N|no|NO|"") return 1 ;;
