@@ -243,6 +243,25 @@ partition_path() {
   fi
 }
 
+find_repo_config_source_dir() {
+  local -a candidates=(
+    "$SCRIPT_DIR/.config"
+    "$PWD/.config"
+    "$SCRIPT_DIR/minimalinux/.config"
+    "$PWD/minimalinux/.config"
+  )
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -d "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 choose_disk_if_missing() {
   if [[ -n "$DISK" ]]; then
     [[ -b "$DISK" ]] || die "Disk not found: $DISK"
@@ -689,12 +708,23 @@ EOF
 
 stage_assets_for_chroot() {
   msg "Staging installer assets in target root"
+
+  local config_source
+
   cp "$SCRIPT_PATH" "$TARGET_MNT/root/install-minimalinux.sh"
   chmod +x "$TARGET_MNT/root/install-minimalinux.sh"
 
   install -d "$TARGET_MNT/root/minimalinux-assets"
   if [[ -d "$SCRIPT_DIR/hypr" ]]; then
     cp -a "$SCRIPT_DIR/hypr" "$TARGET_MNT/root/minimalinux-assets/"
+  fi
+
+  config_source="$(find_repo_config_source_dir || true)"
+  if [[ -n "$config_source" ]]; then
+    msg "Staging repository .config from: $config_source"
+    cp -a "$config_source" "$TARGET_MNT/root/minimalinux-assets/dotconfig"
+  else
+    warn "No repository .config folder found to stage."
   fi
 
   write_install_env
@@ -976,9 +1006,32 @@ apply_hypr_config_assets() {
   local src="/root/minimalinux-assets/hypr"
   [[ -d "$src" ]] || return
 
+  if [[ -d "/home/${USERNAME}/.config/hypr" ]] && [[ -n "$(ls -A "/home/${USERNAME}/.config/hypr" 2>/dev/null || true)" ]]; then
+    msg "Hypr config already present from repo .config; skipping hypr fallback copy"
+    return
+  fi
+
   msg "Applying Hypr config assets for ${USERNAME}"
   install -d "/home/${USERNAME}/.config/hypr"
   cp -a "$src"/* "/home/${USERNAME}/.config/hypr/"
+  chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
+
+  if [[ -d "/home/${USERNAME}/.config/hypr/Scripts" ]]; then
+    find "/home/${USERNAME}/.config/hypr/Scripts" -type f -exec chmod +x {} \;
+  fi
+}
+
+deploy_repo_dotconfig_assets() {
+  local source_dir="/root/minimalinux-assets/dotconfig"
+
+  if [[ ! -d "$source_dir" ]]; then
+    warn "No staged repository .config assets found; skipping .config deployment"
+    return
+  fi
+
+  msg "Deploying repository .config into /home/${USERNAME}/.config"
+  install -d "/home/${USERNAME}/.config"
+  cp -a "$source_dir"/. "/home/${USERNAME}/.config/"
   chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
 
   if [[ -d "/home/${USERNAME}/.config/hypr/Scripts" ]]; then
@@ -1112,6 +1165,7 @@ finalize_in_chroot() {
   [[ -f "${ENV_FILE}" ]] || die "Env file not found: ${ENV_FILE}"
   source "${ENV_FILE}"
   configure_base_system
+  deploy_repo_dotconfig_assets
   provision_minimalinux_stack
   apply_hypr_config_assets
   if [[ "${BOOTLOADER_DONE_BY_ARCHINSTALL:-0}" != "1" ]]; then
