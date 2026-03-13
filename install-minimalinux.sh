@@ -53,7 +53,7 @@ show_welcome_banner() {
 =========================================
 This installer will:
   - Partition and format the selected disk
-  - Install Arch Linux + selected bootloader
+  - Install minimaLinux base + selected bootloader
   - Apply minimaLinux packages and configuration
 
 WARNING: Selected disk data will be permanently erased.
@@ -80,7 +80,7 @@ Usage:
   $(basename "$0") --provision-existing
 
 Modes:
-  default full-install     Full install: partition disk, install base Arch, install bootloader, provision minimaLinux stack.
+  default full-install     Full install: partition disk, install minimaLinux base, install bootloader, provision minimaLinux stack.
   --provision-existing     Skip partition/base install; provision minimaLinux stack on current system.
 
 Options:
@@ -764,6 +764,30 @@ EOF
   sed -i -E 's|^# %wheel ALL=\(ALL:ALL\) ALL|%wheel ALL=(ALL:ALL) ALL|' /etc/sudoers
 }
 
+set_release_key() {
+  local file_path="$1"
+  local key_name="$2"
+  local key_value="$3"
+
+  [[ -f "$file_path" ]] || return
+
+  if grep -qE "^${key_name}=" "$file_path"; then
+    sed -i -E "s|^${key_name}=.*|${key_name}=${key_value}|" "$file_path"
+  else
+    echo "${key_name}=${key_value}" >> "$file_path"
+  fi
+}
+
+apply_minimalinux_os_branding() {
+  msg "Applying minimaLinux OS branding"
+
+  set_release_key /etc/os-release NAME '"minimaLinux"'
+  set_release_key /etc/os-release PRETTY_NAME '"minimaLinux"'
+
+  set_release_key /usr/lib/os-release NAME '"minimaLinux"'
+  set_release_key /usr/lib/os-release PRETTY_NAME '"minimaLinux"'
+}
+
 ensure_multilib() {
   msg "Ensuring multilib is enabled"
   if ! grep -Eq '^[[:space:]]*\[multilib\][[:space:]]*$' /etc/pacman.conf; then
@@ -1092,6 +1116,10 @@ apply_minimalinux_bootloader_branding() {
       if command -v grub-mkconfig >/dev/null 2>&1 && [[ -d /boot/grub ]]; then
         grub-mkconfig -o /boot/grub/grub.cfg || warn "Failed to regenerate GRUB config while applying minimaLinux branding"
       fi
+      if [[ -f /boot/grub/grub.cfg ]]; then
+        sed -i -E 's/Arch Linux/minimaLinux/g; s/Arch GNU\/Linux/minimaLinux/g' /boot/grub/grub.cfg \
+          || warn "Failed to normalize GRUB menu titles to minimaLinux"
+      fi
       ;;
     systemd-boot)
       if [[ -d /boot/loader ]]; then
@@ -1235,6 +1263,7 @@ finalize_in_chroot() {
   [[ -f "${ENV_FILE}" ]] || die "Env file not found: ${ENV_FILE}"
   source "${ENV_FILE}"
   configure_base_system
+  apply_minimalinux_os_branding
   deploy_repo_dotconfig_assets
   provision_minimalinux_stack
   update_xdg_user_dirs
