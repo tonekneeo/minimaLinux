@@ -415,15 +415,6 @@ prompt_account_passwords() {
   local confirm_value
 
   while true; do
-    read -r -s -p "Set root password: " ROOT_PASSWORD
-    echo
-    read -r -s -p "Confirm root password: " confirm_value
-    echo
-    [[ "$ROOT_PASSWORD" == "$confirm_value" && -n "$ROOT_PASSWORD" ]] && break
-    echo "Passwords did not match. Try again."
-  done
-
-  while true; do
     read -r -s -p "Set password for ${USERNAME}: " USER_PASSWORD
     echo
     read -r -s -p "Confirm password for ${USERNAME}: " confirm_value
@@ -431,6 +422,18 @@ prompt_account_passwords() {
     [[ "$USER_PASSWORD" == "$confirm_value" && -n "$USER_PASSWORD" ]] && break
     echo "Passwords did not match. Try again."
   done
+
+  ROOT_PASSWORD=""
+  if confirm "Set a root password?"; then
+    while true; do
+      read -r -s -p "Set root password: " ROOT_PASSWORD
+      echo
+      read -r -s -p "Confirm root password: " confirm_value
+      echo
+      [[ "$ROOT_PASSWORD" == "$confirm_value" && -n "$ROOT_PASSWORD" ]] && break
+      echo "Passwords did not match. Try again."
+    done
+  fi
 }
 
 validate_install_choices() {
@@ -754,10 +757,16 @@ configure_base_system() {
 127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
 EOF
 
-  echo "root:${ROOT_PASSWORD}" | chpasswd
+  if [[ -n "${ROOT_PASSWORD}" ]]; then
+    echo "root:${ROOT_PASSWORD}" | chpasswd
+  else
+    warn "No root password set by user choice; root account password remains unset/locked."
+  fi
 
   if ! id -u "$USERNAME" >/dev/null 2>&1; then
     useradd -m -G wheel -s /bin/bash "$USERNAME"
+  else
+    usermod -aG wheel "$USERNAME" || true
   fi
   echo "${USERNAME}:${USER_PASSWORD}" | chpasswd
 
@@ -1250,8 +1259,8 @@ provision_minimalinux_stack() {
   install_app_packages
   install_hyprland_stack
   install_dev_packages
-  install_gaming_packages
   install_gpu_profile
+  install_gaming_packages
   install_minimalinux_extras
   install_selected_browser
   setup_i2c
