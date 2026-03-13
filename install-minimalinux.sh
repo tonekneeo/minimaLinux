@@ -888,14 +888,25 @@ install_bootloader() {
 
         [[ -b "$install_disk" ]] || die "Disk not available in chroot for BIOS grub install: ${install_disk}"
 
+        msg "BIOS GRUB target disk: ${install_disk} (root partition: ${ROOT_PART})"
+
         grub-install --target=i386-pc --boot-directory=/boot --recheck "$install_disk" \
           || grub-install --target=i386-pc --boot-directory=/boot --recheck --force "$install_disk"
+
+        if ! dd if="$install_disk" bs=440 count=1 2>/dev/null | strings | grep -q 'GRUB'; then
+          msg "MBR does not contain GRUB signature after initial install; retrying with explicit modules"
+          grub-install --target=i386-pc --boot-directory=/boot --recheck --force \
+            --modules="part_msdos ext2 biosdisk" "$install_disk"
+        fi
 
         if command -v hexdump >/dev/null 2>&1; then
           local mbr_sig
           mbr_sig="$(dd if="$install_disk" bs=440 count=1 2>/dev/null | hexdump -ve '1/1 "%02x"' | tr -d '0')"
           [[ -n "$mbr_sig" ]] || die "MBR boot code appears empty on ${install_disk} after grub-install."
         fi
+
+        dd if="$install_disk" bs=440 count=1 2>/dev/null | strings | grep -q 'GRUB' \
+          || die "GRUB signature not found in MBR boot code on ${install_disk}."
       fi
       grub-mkconfig -o /boot/grub/grub.cfg
       [[ -s /boot/grub/grub.cfg ]] || die "GRUB config was not generated."
