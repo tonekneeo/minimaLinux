@@ -6,29 +6,27 @@ export LC_MESSAGES=C
 export LANG=C
 
 SCRIPT_INPUT_PATH="${BASH_SOURCE[0]:-$0}"
-TEMP_SCRIPT_COPY=""
-
 if [[ "$SCRIPT_INPUT_PATH" =~ ^/proc/.*?/fd/[0-9]+$ || "$SCRIPT_INPUT_PATH" =~ ^/dev/fd/[0-9]+$ ]]; then
-  TEMP_SCRIPT_COPY="$(mktemp /tmp/minimalinux-installer.XXXXXX.sh)"
-  cat "$SCRIPT_INPUT_PATH" > "$TEMP_SCRIPT_COPY"
-  chmod +x "$TEMP_SCRIPT_COPY"
-  SCRIPT_PATH="$TEMP_SCRIPT_COPY"
-else
+  SCRIPT_PATH=""
+elif [[ -r "$SCRIPT_INPUT_PATH" ]]; then
   SCRIPT_PATH="$(readlink -f "$SCRIPT_INPUT_PATH")"
+else
+  SCRIPT_PATH=""
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-
-cleanup_temp_script_copy() {
-  if [[ -n "${TEMP_SCRIPT_COPY:-}" && -f "$TEMP_SCRIPT_COPY" ]]; then
-    rm -f "$TEMP_SCRIPT_COPY"
-  fi
-}
-trap cleanup_temp_script_copy EXIT
+if [[ -n "$SCRIPT_PATH" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+else
+  SCRIPT_DIR="$PWD"
+fi
 LOG_DIR="/var/log"
 LOG_FILE="${LOG_DIR}/minimalinux-install-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_GITHUB_REPO="Echilonvibin/minimaLinux"
 DEFAULT_GITHUB_REF="main"
+SCRIPT_DISPLAY_NAME="$(basename "${SCRIPT_PATH:-minimalinux.sh}")"
+if [[ "$SCRIPT_DISPLAY_NAME" =~ ^[0-9]+$ || -z "$SCRIPT_DISPLAY_NAME" ]]; then
+  SCRIPT_DISPLAY_NAME="minimalinux.sh"
+fi
 
 MODE="full-install"
 TARGET_MNT="/mnt"
@@ -95,9 +93,9 @@ run_preflight_checks() {
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0")
-  $(basename "$0") --disk /dev/nvme0n1 --bootloader grub --hostname minimalinux --username tonekneeo
-  $(basename "$0") --provision-existing
+  ${SCRIPT_DISPLAY_NAME}
+  ${SCRIPT_DISPLAY_NAME} --disk /dev/nvme0n1 --bootloader grub --hostname minimalinux --username tonekneeo
+  ${SCRIPT_DISPLAY_NAME} --provision-existing
 
 Modes:
   default full-install     Full install: partition disk, install minimaLinux base, install bootloader, provision minimaLinux stack.
@@ -350,6 +348,39 @@ download_repo_dotconfig_from_github() {
 
   rm -rf "$tmp_root"
   warn "Failed to download .config from GitHub repository ${repo}"
+  return 1
+}
+
+download_installer_script_from_github() {
+  local destination="$1"
+  local repo="${MINIMALINUX_GITHUB_REPO:-$DEFAULT_GITHUB_REPO}"
+  local preferred_ref="${MINIMALINUX_GITHUB_REF:-$DEFAULT_GITHUB_REF}"
+  local -a refs=("$preferred_ref")
+  local ref
+  local url
+
+  if [[ "$preferred_ref" != "main" ]]; then
+    refs+=("main")
+  fi
+  if [[ "$preferred_ref" != "master" ]]; then
+    refs+=("master")
+  fi
+
+  for ref in "${refs[@]}"; do
+    url="https://raw.githubusercontent.com/${repo}/${ref}/minimalinux.sh"
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fsSL "$url" -o "$destination"; then
+        chmod +x "$destination"
+        return 0
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      if wget -q "$url" -O "$destination"; then
+        chmod +x "$destination"
+        return 0
+      fi
+    fi
+  done
+
   return 1
 }
 
@@ -805,8 +836,14 @@ stage_assets_for_chroot() {
 
   local config_source
 
-  cp "$SCRIPT_PATH" "$TARGET_MNT/root/install-minimalinux.sh"
-  chmod +x "$TARGET_MNT/root/install-minimalinux.sh"
+  if [[ -n "$SCRIPT_PATH" && -r "$SCRIPT_PATH" ]]; then
+    cp "$SCRIPT_PATH" "$TARGET_MNT/root/install-minimalinux.sh"
+    chmod +x "$TARGET_MNT/root/install-minimalinux.sh"
+  else
+    msg "Installer launched from stream; fetching script from GitHub for chroot stage"
+    download_installer_script_from_github "$TARGET_MNT/root/install-minimalinux.sh" \
+      || die "Unable to stage installer script in chroot (local script missing and GitHub fetch failed)."
+  fi
 
   install -d "$TARGET_MNT/root/minimalinux-assets"
   if [[ -d "$SCRIPT_DIR/hypr" ]]; then
