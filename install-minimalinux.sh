@@ -9,6 +9,8 @@ SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 LOG_DIR="/var/log"
 LOG_FILE="${LOG_DIR}/minimalinux-install-$(date +%Y%m%d-%H%M%S).log"
+DEFAULT_GITHUB_REPO="Echilonvibin/minimaLinux"
+DEFAULT_GITHUB_REF="main"
 
 MODE="full-install"
 TARGET_MNT="/mnt"
@@ -259,6 +261,77 @@ find_repo_config_source_dir() {
     fi
   done
 
+  return 1
+}
+
+download_repo_dotconfig_from_github() {
+  local destination="$1"
+  local repo="${MINIMALINUX_GITHUB_REPO:-$DEFAULT_GITHUB_REPO}"
+  local preferred_ref="${MINIMALINUX_GITHUB_REF:-$DEFAULT_GITHUB_REF}"
+  local -a refs=("$preferred_ref")
+  local downloader=""
+  local tmp_root=""
+  local archive=""
+  local extract_dir=""
+  local ref
+  local url
+  local extracted_config
+
+  if [[ "$preferred_ref" != "main" ]]; then
+    refs+=("main")
+  fi
+  if [[ "$preferred_ref" != "master" ]]; then
+    refs+=("master")
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    downloader="curl"
+  elif command -v wget >/dev/null 2>&1; then
+    downloader="wget"
+  else
+    warn "Neither curl nor wget is available; cannot fetch .config from GitHub"
+    return 1
+  fi
+
+  if ! command -v tar >/dev/null 2>&1; then
+    warn "tar is required to extract the GitHub archive"
+    return 1
+  fi
+
+  tmp_root="$(mktemp -d)"
+  archive="$tmp_root/minimalinux-config.tar.gz"
+  extract_dir="$tmp_root/extracted"
+
+  for ref in "${refs[@]}"; do
+    rm -rf "$extract_dir"
+    mkdir -p "$extract_dir"
+    url="https://codeload.github.com/${repo}/tar.gz/refs/heads/${ref}"
+
+    if [[ "$downloader" == "curl" ]]; then
+      if ! curl -fsSL "$url" -o "$archive"; then
+        continue
+      fi
+    else
+      if ! wget -q "$url" -O "$archive"; then
+        continue
+      fi
+    fi
+
+    if ! tar -xzf "$archive" -C "$extract_dir"; then
+      continue
+    fi
+
+    extracted_config="$(find "$extract_dir" -mindepth 2 -maxdepth 2 -type d -name .config | head -n 1)"
+    if [[ -d "$extracted_config" ]]; then
+      rm -rf "$destination"
+      cp -a "$extracted_config" "$destination"
+      rm -rf "$tmp_root"
+      return 0
+    fi
+  done
+
+  rm -rf "$tmp_root"
+  warn "Failed to download .config from GitHub repository ${repo}"
   return 1
 }
 
@@ -727,7 +800,12 @@ stage_assets_for_chroot() {
     msg "Staging repository .config from: $config_source"
     cp -a "$config_source" "$TARGET_MNT/root/minimalinux-assets/dotconfig"
   else
-    warn "No repository .config folder found to stage."
+    msg "No local repository .config folder found; fetching from GitHub"
+    if download_repo_dotconfig_from_github "$TARGET_MNT/root/minimalinux-assets/dotconfig"; then
+      msg "Staged repository .config from GitHub"
+    else
+      warn "No repository .config folder found to stage."
+    fi
   fi
 
   write_install_env
