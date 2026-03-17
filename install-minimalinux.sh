@@ -132,6 +132,16 @@ require_common_tools() {
   command -v systemctl >/dev/null 2>&1 || die "systemctl is required."
 }
 
+ensure_tty_stdin() {
+  if [[ ! -t 0 ]]; then
+    if [[ -r /dev/tty ]]; then
+      exec </dev/tty
+    else
+      die "Interactive install requires a TTY for prompts. Run from a real terminal session."
+    fi
+  fi
+}
+
 require_full_install_tools() {
   command -v archinstall >/dev/null 2>&1 || die "Core installer backend is required."
   command -v pacstrap >/dev/null 2>&1 || die "pacstrap is required."
@@ -1441,6 +1451,7 @@ finalize_in_chroot() {
 }
 
 run_full_install() {
+  ensure_tty_stdin
   require_full_install_tools
   show_welcome_banner
   run_preflight_checks
