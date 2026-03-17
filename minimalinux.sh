@@ -21,7 +21,7 @@ else
 fi
 LOG_DIR="/var/log"
 LOG_FILE="${LOG_DIR}/minimalinux-install-$(date +%Y%m%d-%H%M%S).log"
-DEFAULT_GITHUB_REPO="Echilonvibin/minimaLinux"
+DEFAULT_GITHUB_REPO="tonekneeo/minimaLinux"
 DEFAULT_GITHUB_REF="main"
 SCRIPT_DISPLAY_NAME="$(basename "${SCRIPT_PATH:-minimalinux.sh}")"
 if [[ "$SCRIPT_DISPLAY_NAME" =~ ^[0-9]+$ || -z "$SCRIPT_DISPLAY_NAME" ]]; then
@@ -366,6 +366,10 @@ download_installer_script_from_github() {
   local repo="${MINIMALINUX_GITHUB_REPO:-$DEFAULT_GITHUB_REPO}"
   local preferred_ref="${MINIMALINUX_GITHUB_REF:-$DEFAULT_GITHUB_REF}"
   local -a refs=("$preferred_ref")
+  local -a repos=("$repo" "tonekneeo/minimaLinux" "Echilonvibin/minimaLinux")
+  local -a script_names=("${MINIMALINUX_GITHUB_SCRIPT:-}" "minimalinux.sh" "install-minimalinux.sh")
+  local repo_name
+  local script_name
   local ref
   local url
 
@@ -376,21 +380,28 @@ download_installer_script_from_github() {
     refs+=("master")
   fi
 
-  for ref in "${refs[@]}"; do
-    url="https://raw.githubusercontent.com/${repo}/${ref}/minimalinux.sh"
-    if command -v curl >/dev/null 2>&1; then
-      if curl -fsSL "$url" -o "$destination"; then
-        chmod +x "$destination"
-        return 0
-      fi
-    elif command -v wget >/dev/null 2>&1; then
-      if wget -q "$url" -O "$destination"; then
-        chmod +x "$destination"
-        return 0
-      fi
-    fi
+  for repo_name in "${repos[@]}"; do
+    [[ -n "$repo_name" ]] || continue
+    for ref in "${refs[@]}"; do
+      for script_name in "${script_names[@]}"; do
+        [[ -n "$script_name" ]] || continue
+        url="https://raw.githubusercontent.com/${repo_name}/${ref}/${script_name}"
+        if command -v curl >/dev/null 2>&1; then
+          if curl -fsSL "$url" -o "$destination"; then
+            chmod +x "$destination"
+            return 0
+          fi
+        elif command -v wget >/dev/null 2>&1; then
+          if wget -q "$url" -O "$destination"; then
+            chmod +x "$destination"
+            return 0
+          fi
+        fi
+      done
+    done
   done
 
+  warn "Failed to download installer script from GitHub (tried multiple repo/name combinations)."
   return 1
 }
 
@@ -540,7 +551,6 @@ prompt_install_options() {
     7|all-open) GPU_PROFILE="all-open" ;;
     *) die "Invalid GPU profile choice: $choice" ;;
   esac
-
 }
 
 prompt_account_passwords() {
