@@ -5,8 +5,26 @@ set -euo pipefail
 export LC_MESSAGES=C
 export LANG=C
 
-SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_INPUT_PATH="${BASH_SOURCE[0]:-$0}"
+TEMP_SCRIPT_COPY=""
+
+if [[ "$SCRIPT_INPUT_PATH" =~ ^/proc/.*?/fd/[0-9]+$ || "$SCRIPT_INPUT_PATH" =~ ^/dev/fd/[0-9]+$ ]]; then
+  TEMP_SCRIPT_COPY="$(mktemp /tmp/minimalinux-installer.XXXXXX.sh)"
+  cat "$SCRIPT_INPUT_PATH" > "$TEMP_SCRIPT_COPY"
+  chmod +x "$TEMP_SCRIPT_COPY"
+  SCRIPT_PATH="$TEMP_SCRIPT_COPY"
+else
+  SCRIPT_PATH="$(readlink -f "$SCRIPT_INPUT_PATH")"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+cleanup_temp_script_copy() {
+  if [[ -n "${TEMP_SCRIPT_COPY:-}" && -f "$TEMP_SCRIPT_COPY" ]]; then
+    rm -f "$TEMP_SCRIPT_COPY"
+  fi
+}
+trap cleanup_temp_script_copy EXIT
 LOG_DIR="/var/log"
 LOG_FILE="${LOG_DIR}/minimalinux-install-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_GITHUB_REPO="Echilonvibin/minimaLinux"
