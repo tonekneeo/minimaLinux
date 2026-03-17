@@ -23,6 +23,7 @@ LOG_DIR="/var/log"
 LOG_FILE="${LOG_DIR}/minimalinux-install-$(date +%Y%m%d-%H%M%S).log"
 DEFAULT_GITHUB_REPO="tonekneeo/minimaLinux"
 DEFAULT_GITHUB_REF="main"
+DEFAULT_GITHUB_SCRIPT_NAME="minimalinux.sh"
 SCRIPT_DISPLAY_NAME="$(basename "${SCRIPT_PATH:-minimalinux.sh}")"
 if [[ "$SCRIPT_DISPLAY_NAME" =~ ^[0-9]+$ || -z "$SCRIPT_DISPLAY_NAME" ]]; then
   SCRIPT_DISPLAY_NAME="minimalinux.sh"
@@ -367,7 +368,7 @@ download_installer_script_from_github() {
   local preferred_ref="${MINIMALINUX_GITHUB_REF:-$DEFAULT_GITHUB_REF}"
   local -a refs=("$preferred_ref")
   local -a repos=("$repo" "tonekneeo/minimaLinux" "Echilonvibin/minimaLinux")
-  local -a script_names=("${MINIMALINUX_GITHUB_SCRIPT:-}" "minimalinux.sh" "install-minimalinux.sh")
+  local -a script_names=("${MINIMALINUX_GITHUB_SCRIPT:-$DEFAULT_GITHUB_SCRIPT_NAME}" "minimalinux.sh" "install-minimalinux.sh")
   local repo_name
   local script_name
   local ref
@@ -387,12 +388,12 @@ download_installer_script_from_github() {
         [[ -n "$script_name" ]] || continue
         url="https://raw.githubusercontent.com/${repo_name}/${ref}/${script_name}"
         if command -v curl >/dev/null 2>&1; then
-          if curl -fsSL "$url" -o "$destination"; then
+          if curl -fsSL "$url" -o "$destination" 2>/dev/null; then
             chmod +x "$destination"
             return 0
           fi
         elif command -v wget >/dev/null 2>&1; then
-          if wget -q "$url" -O "$destination"; then
+          if wget -q "$url" -O "$destination" 2>/dev/null; then
             chmod +x "$destination"
             return 0
           fi
@@ -401,7 +402,7 @@ download_installer_script_from_github() {
     done
   done
 
-  warn "Failed to download installer script from GitHub (tried multiple repo/name combinations)."
+  warn "Failed to download installer script from GitHub (tried ${repo}@${preferred_ref} and fallback locations)."
   return 1
 }
 
